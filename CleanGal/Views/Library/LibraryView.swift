@@ -169,19 +169,19 @@ private struct SelectionToolbarContent: View {
     let sections: [PhotoLibraryService.DateSection]
 
     @Environment(PhotoLibraryService.self) private var photoService
-    @State private var showShareSheet = false
-    @State private var shareItems: [Any] = []
+    @State private var shareRequest: ShareRequest?
+    @State private var isPreparingShare = false
+    @State private var showShareError = false
     @State private var showDeleteConfirmation = false
 
     var body: some View {
         HStack {
-            Button("Share", systemImage: "square.and.arrow.up") {
-                Task {
-                    shareItems = await photoService.loadShareItems(for: viewModel.selectedIdentifiers)
-                    showShareSheet = true
-                }
+            if isPreparingShare {
+                ProgressView()
+            } else {
+                Button("Share", systemImage: "square.and.arrow.up", action: shareSelected)
+                    .disabled(viewModel.selectedCount == 0)
             }
-            .disabled(viewModel.selectedCount == 0)
 
             Spacer()
 
@@ -197,8 +197,13 @@ private struct SelectionToolbarContent: View {
             .tint(.red)
             .disabled(viewModel.selectedCount == 0)
         }
-        .sheet(isPresented: $showShareSheet) {
-            ShareSheet(items: shareItems)
+        .sheet(item: $shareRequest) { request in
+            ShareSheet(items: request.items, onComplete: { photoService.cleanUpShareFiles() })
+        }
+        .alert("Couldn't Prepare for Sharing", isPresented: $showShareError) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("These items couldn't be exported. If they're stored in iCloud, check your connection and try again.")
         }
         .confirmationDialog(
             "Delete \(viewModel.selectedCount) items?",
@@ -210,13 +215,29 @@ private struct SelectionToolbarContent: View {
                 let service = photoService // capture before anything can tear this view down
                 let selection = viewModel
                 Task {
-                    if (try? await service.deleteAssets(targets)) == true {
+                    if await service.deleteAssets(targets) {
                         selection.clearSelection()
                     }
                 }
             }
         } message: {
             Text("These items will be moved to Recently Deleted.")
+        }
+    }
+
+    private func shareSelected() {
+        guard !isPreparingShare else { return }
+        isPreparingShare = true
+        let identifiers = viewModel.selectedIdentifiers
+
+        Task {
+            let loaded = await photoService.loadShareItems(for: identifiers)
+            isPreparingShare = false
+            if loaded.isEmpty {
+                showShareError = true
+            } else {
+                shareRequest = ShareRequest(items: loaded)
+            }
         }
     }
 }

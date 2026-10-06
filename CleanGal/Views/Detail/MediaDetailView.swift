@@ -12,8 +12,9 @@ struct MediaDetailView: View {
     @State private var currentAssetID: String?
     @State private var showControls = true
     @State private var showInfo = false
-    @State private var showShareSheet = false
-    @State private var shareItems: [Any] = []
+    @State private var shareRequest: ShareRequest?
+    @State private var isPreparingShare = false
+    @State private var showShareError = false
     @State private var showDeleteConfirmation = false
 
     var body: some View {
@@ -51,29 +52,37 @@ struct MediaDetailView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbarVisibility(showControls ? .visible : .hidden, for: .navigationBar)
         .toolbar {
-            ToolbarItemGroup(placement: .bottomBar) {
-                if showControls {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                if isPreparingShare {
+                    ProgressView()
+                } else {
                     Button("Share", systemImage: "square.and.arrow.up", action: shareCurrentAsset)
-                    Spacer()
-                    Button("Info", systemImage: "info.circle") {
-                        showInfo = true
-                    }
-                    Spacer()
-                    Button("Delete", systemImage: "trash", role: .destructive) {
-                        showDeleteConfirmation = true
-                    }
-                    .tint(.red)
                 }
+
+                Button("Info", systemImage: "info.circle") {
+                    showInfo = true
+                }
+
+                Button("Delete", systemImage: "trash", role: .destructive) {
+                    showDeleteConfirmation = true
+                }
+                .tint(.red)
             }
         }
-        .toolbarVisibility(showControls ? .visible : .hidden, for: .bottomBar)
+        // The viewer is full screen and has no bottom bar any more, so keep the tab bar out of the way.
+        .toolbar(.hidden, for: .tabBar)
         .sheet(isPresented: $showInfo) {
             if let asset = currentAsset {
                 MediaInfoView(asset: asset)
             }
         }
-        .sheet(isPresented: $showShareSheet) {
-            ShareSheet(items: shareItems)
+        .sheet(item: $shareRequest) { request in
+            ShareSheet(items: request.items, onComplete: { photoService.cleanUpShareFiles() })
+        }
+        .alert("Couldn't Prepare for Sharing", isPresented: $showShareError) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("This item couldn't be exported. If it's stored in iCloud, check your connection and try again.")
         }
         .confirmationDialog(
             "Delete Item",
@@ -90,17 +99,23 @@ struct MediaDetailView: View {
         .statusBarHidden(!showControls)
     }
 
+    /// Falls back to the opened item, so Share and Info work even before the pager reports a position.
     private var currentAsset: PHAsset? {
-        allAssets.first { $0.localIdentifier == currentAssetID }
+        let id = currentAssetID ?? initialAssetID
+        return allAssets.first { $0.localIdentifier == id }
     }
 
     private func shareCurrentAsset() {
-        guard let asset = currentAsset else { return }
+        guard let asset = currentAsset, !isPreparingShare else { return }
+        isPreparingShare = true
+
         Task {
             let loaded = await photoService.loadShareItems(for: [asset.localIdentifier])
-            if !loaded.isEmpty {
-                shareItems = loaded
-                showShareSheet = true
+            isPreparingShare = false
+            if loaded.isEmpty {
+                showShareError = true
+            } else {
+                shareRequest = ShareRequest(items: loaded)
             }
         }
     }
@@ -110,7 +125,7 @@ struct MediaDetailView: View {
         let service = photoService // capture before the view can be dismissed
         let dismissAction = dismiss
         Task {
-            if (try? await service.deleteAssets([targetID])) == true {
+            if await service.deleteAssets([targetID]) {
                 dismissAction()
             }
         }

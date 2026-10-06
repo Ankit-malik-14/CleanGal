@@ -156,7 +156,7 @@ struct AlbumDetailView: View {
         let selection = viewModel
 
         Task {
-            if (try? await service.deleteAssets(targets)) == true {
+            if await service.deleteAssets(targets) {
                 assets.removeAll { targets.contains($0.localIdentifier) }
                 selection.clearSelection()
             }

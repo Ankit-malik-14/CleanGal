@@ -1,6 +1,8 @@
 import SwiftUI
 
 struct ContentView: View {
+    @Environment(PhotoLibraryService.self) private var photoService
+
     var body: some View {
         TabView {
             Tab("Library", systemImage: "photo.on.rectangle.angled") {
@@ -11,6 +13,22 @@ struct ContentView: View {
                 AlbumsView()
             }
         }
+        .alert("Couldn't Delete", isPresented: deleteErrorBinding) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(photoService.deleteErrorMessage ?? "")
+        }
+    }
+
+    private var deleteErrorBinding: Binding<Bool> {
+        Binding(
+            get: { photoService.deleteErrorMessage != nil },
+            set: { isPresented in
+                if !isPresented {
+                    photoService.deleteErrorMessage = nil
+                }
+            }
+        )
     }
 }
 

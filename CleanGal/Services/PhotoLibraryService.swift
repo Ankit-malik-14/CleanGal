@@ -3,6 +3,7 @@ import SwiftUI
 import ImageIO
 import CoreLocation
 import AVFoundation
+import UniformTypeIdentifiers
 
 @Observable
 @MainActor
@@ -30,6 +31,9 @@ final class PhotoLibraryService {
     var isLoadingAlbums = false
     var hasLoadedAlbums = false
 
+    /// Set when a delete fails for a reason other than the user cancelling. Shown as an alert in ContentView.
+    var deleteErrorMessage: String?
+
     // MARK: - Private
 
     private var fetchResult: PHFetchResult<PHAsset>?
@@ -40,11 +44,17 @@ final class PhotoLibraryService {
     private var changeObserver: LibraryChangeObserver?
     @ObservationIgnored private var reloadTask: Task<Void, Never>?
     @ObservationIgnored private var videoSizeCache: [String: Int64] = [:]
-    private(set) var thumbnailCache: [String: UIImage] = [:]
+    @ObservationIgnored private var shareFolders: [URL] = []
+    /// Bounded by decoded size, and NSCache also evicts it automatically under memory pressure.
+    @ObservationIgnored private let thumbnailCache: NSCache<NSString, UIImage> = {
+        let cache = NSCache<NSString, UIImage>()
+        cache.totalCostLimit = 96 * 1024 * 1024
+        return cache
+    }()
 
     // MARK: - Types
 
-    struct DateSection: Identifiable, Sendable {
+    nonisolated struct DateSection: Identifiable, Sendable {
         let id: Date
         let title: String
         let assets: [PHAsset]
@@ -73,6 +83,7 @@ final class PhotoLibraryService {
     init() {
         imageManager.allowsCachingHighQualityImages = false
         setupChangeObserver()
+        Self.removeStaleShareFiles()
     }
 
     // MARK: - Authorization
@@ -96,7 +107,7 @@ final class PhotoLibraryService {
         fetchResult = result
 
         let sections = await Task.detached(priority: .userInitiated) {
-            await Self.groupByDate(result)
+            Self.groupByDate(result)
         }.value
 
         dateSections = sections
@@ -300,7 +311,8 @@ final class PhotoLibraryService {
 
         // Only reuse a cached image if it is big enough for this request. Otherwise a small
         // thumbnail loaded first (e.g. in a list row) would be reused blurry in a larger grid.
-        if let cached = thumbnailCache[asset.localIdentifier],
+        let cacheKey = asset.localIdentifier as NSString
+        if let cached = thumbnailCache.object(forKey: cacheKey),
            Self.longestSide(of: cached) >= requestedSide * 0.9 {
             return cached
         }
@@ -323,9 +335,9 @@ final class PhotoLibraryService {
 
         if let image {
             // Keep the largest version we have seen for this asset.
-            let existingSide = thumbnailCache[asset.localIdentifier].map(Self.longestSide(of:)) ?? 0
+            let existingSide = thumbnailCache.object(forKey: cacheKey).map(Self.longestSide(of:)) ?? 0
             if Self.longestSide(of: image) > existingSide {
-                thumbnailCache[asset.localIdentifier] = image
+                thumbnailCache.setObject(image, forKey: cacheKey, cost: Self.decodedCost(of: image))
             }
         }
         return image
@@ -333,6 +345,16 @@ final class PhotoLibraryService {
 
     private static func longestSide(of image: UIImage) -> CGFloat {
         max(image.size.width, image.size.height) * image.scale
+    }
+
+    /// Approximate decoded bytes (4 bytes per pixel), used as the NSCache cost.
+    private static func decodedCost(of image: UIImage) -> Int {
+        Int(image.size.width * image.scale * image.size.height * image.scale * 4)
+    }
+
+    /// Returns a thumbnail that was already loaded, if it is still cached.
+    func cachedThumbnail(for identifier: String) -> UIImage? {
+        thumbnailCache.object(forKey: identifier as NSString)
     }
 
     func loadFullImage(for asset: PHAsset) async -> UIImage? {
@@ -615,9 +637,10 @@ final class PhotoLibraryService {
     // MARK: - Operations
 
     /// Deletes the given assets.
-    /// - Returns: `true` if the assets were deleted, `false` if the user cancelled the system prompt.
+    /// - Returns: `true` if the assets were deleted. `false` if the user cancelled the system
+    ///   prompt, or if the delete failed (in which case `deleteErrorMessage` is set).
     @discardableResult
-    func deleteAssets(_ identifiers: Set<String>) async throws -> Bool {
+    func deleteAssets(_ identifiers: Set<String>) async -> Bool {
         guard !identifiers.isEmpty else { return false }
 
         do {
@@ -625,6 +648,24 @@ final class PhotoLibraryService {
             return true
         } catch let error as PHPhotosError where error.code == .userCancelled {
             return false
+        } catch {
+            deleteErrorMessage = Self.deletionMessage(for: error)
+            return false
+        }
+    }
+
+    private nonisolated static func deletionMessage(for error: Error) -> String {
+        guard let code = (error as? PHPhotosError)?.code else {
+            return "The selected items couldn't be deleted. Please try again."
+        }
+
+        switch code {
+        case .accessUserDenied, .accessRestricted:
+            return "CleanGal isn't allowed to change your photo library. You can update this in Settings."
+        case .networkAccessRequired, .networkError:
+            return "Some of these items are stored in iCloud and need an internet connection to be deleted. Check your connection and try again."
+        default:
+            return "The selected items couldn't be deleted. Please try again."
         }
     }
 
@@ -637,7 +678,11 @@ final class PhotoLibraryService {
         }
     }
 
+    /// Exports each item's original file to a temporary folder and returns the file URLs.
+    /// Sharing URLs avoids holding full-resolution images in memory. Call
+    /// `cleanUpShareFiles()` once the share sheet finishes.
     func loadShareItems(for identifiers: Set<String>) async -> [Any] {
+        let directory = Self.shareDirectory
         var items: [Any] = []
 
         for identifier in identifiers {
@@ -645,20 +690,37 @@ final class PhotoLibraryService {
                 withLocalIdentifiers: [identifier],
                 options: nil
             )
-            guard let asset = fetchResult.firstObject else { continue }
+            guard let asset = fetchResult.firstObject,
+                  let url = await exportForSharing(asset, into: directory)
+            else { continue }
 
-            if asset.mediaType == .image {
-                if let image = await loadFullImage(for: asset) {
-                    items.append(image)
-                }
-            } else if asset.mediaType == .video {
-                if let url = await loadVideoURL(for: asset) {
-                    items.append(url)
-                }
-            }
+            items.append(ShareItemSource(url: url, thumbnail: cachedThumbnail(for: identifier)))
         }
 
         return items
+    }
+
+    /// Deletes the files exported for the share that just finished. Only folders created by
+    /// this session are removed, so it can never delete a share that is still being prepared.
+    func cleanUpShareFiles() {
+        let folders = shareFolders
+        shareFolders.removeAll()
+        guard !folders.isEmpty else { return }
+
+        Task.detached(priority: .utility) {
+            for folder in folders {
+                try? FileManager.default.removeItem(at: folder)
+            }
+        }
+    }
+
+    /// Runs once at launch, synchronously, so it always finishes before the first share.
+    private nonisolated static func removeStaleShareFiles() {
+        try? FileManager.default.removeItem(at: shareDirectory)
+    }
+
+    private nonisolated static var shareDirectory: URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent("CleanGalShare", isDirectory: true)
     }
 
     // MARK: - Private Helpers
@@ -678,30 +740,54 @@ final class PhotoLibraryService {
         }
     }
 
-    private func loadVideoURL(for asset: PHAsset) async -> URL? {
+    /// Writes the best version of the asset (the edit if there is one) into its own
+    /// subfolder, keeping the original file name so recipients see a sensible name.
+    private func exportForSharing(_ asset: PHAsset, into directory: URL) async -> URL? {
         let resources = PHAssetResource.assetResources(for: asset)
-        guard let videoResource = resources.first(where: { $0.type == .video || $0.type == .pairedVideo }) else {
+        let preferredTypes: [PHAssetResourceType] = asset.mediaType == .video
+            ? [.fullSizeVideo, .video]
+            : [.fullSizePhoto, .photo]
+
+        var chosen: PHAssetResource?
+        for type in preferredTypes {
+            if let match = resources.first(where: { $0.type == type }) {
+                chosen = match
+                break
+            }
+        }
+        guard let resource = chosen else { return nil }
+
+        let original = resources.first { $0.type == .photo || $0.type == .video } ?? resource
+        let baseName = URL(fileURLWithPath: original.originalFilename)
+            .deletingPathExtension()
+            .lastPathComponent
+        let fileExtension = UTType(resource.uniformTypeIdentifier)?.preferredFilenameExtension
+            ?? URL(fileURLWithPath: resource.originalFilename).pathExtension
+
+        let folder = directory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        } catch {
             return nil
         }
+        shareFolders.append(folder)
 
-        let tempURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString)
-            .appendingPathExtension(videoResource.originalFilename.components(separatedBy: ".").last ?? "mov")
+        var fileURL = folder.appendingPathComponent(baseName)
+        if !fileExtension.isEmpty {
+            fileURL = fileURL.appendingPathExtension(fileExtension)
+        }
+        let destination = fileURL
 
         return await withCheckedContinuation { continuation in
             let options = PHAssetResourceRequestOptions()
             options.isNetworkAccessAllowed = true
 
             PHAssetResourceManager.default().writeData(
-                for: videoResource,
-                toFile: tempURL,
+                for: resource,
+                toFile: destination,
                 options: options
             ) { error in
-                if error == nil {
-                    continuation.resume(returning: tempURL)
-                } else {
-                    continuation.resume(returning: nil)
-                }
+                continuation.resume(returning: error == nil ? destination : nil)
             }
         }
     }
@@ -735,7 +821,7 @@ final class PhotoLibraryService {
         info.colorSpace = properties[kCGImagePropertyColorModel as String] as? String
     }
 
-    private static func groupByDate(_ fetchResult: PHFetchResult<PHAsset>) -> [DateSection] {
+    private nonisolated static func groupByDate(_ fetchResult: PHFetchResult<PHAsset>) -> [DateSection] {
         var sections: [(date: Date, assets: [PHAsset])] = []
         let calendar = Calendar.current
 
@@ -758,7 +844,7 @@ final class PhotoLibraryService {
         }
     }
 
-    private static func formatSectionDate(_ date: Date) -> String {
+    private nonisolated static func formatSectionDate(_ date: Date) -> String {
         let calendar = Calendar.current
         if calendar.isDateInToday(date) {
             return "Today"

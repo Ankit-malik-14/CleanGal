@@ -21,7 +21,7 @@ struct ZoomableImageView: View {
         }
         .onAppear {
             if displayImage == nil {
-                displayImage = photoService.thumbnailCache[asset.localIdentifier]
+                displayImage = photoService.cachedThumbnail(for: asset.localIdentifier)
             }
         }
         .task(id: asset.localIdentifier) {

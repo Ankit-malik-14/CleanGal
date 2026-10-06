@@ -206,7 +206,7 @@ struct DuplicateReviewView: View {
         let service = photoService
 
         Task {
-            if (try? await service.deleteAssets(targets)) == true {
+            if await service.deleteAssets(targets) {
                 service.removeFromScanResults(targets)
                 toDelete.subtract(targets)
             }

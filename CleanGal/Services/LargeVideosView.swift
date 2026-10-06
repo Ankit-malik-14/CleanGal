@@ -138,7 +138,7 @@ struct LargeVideosView: View {
         let selection = viewModel
 
         Task {
-            if (try? await service.deleteAssets(targets)) == true {
+            if await service.deleteAssets(targets) {
                 service.removeLargeVideos(withIdentifiers: targets)
                 selection.clearSelection()
             }
