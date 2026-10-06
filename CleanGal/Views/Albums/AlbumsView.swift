@@ -295,7 +295,6 @@ struct DuplicatesView: View {
     let namespace: Namespace.ID
 
     @Environment(PhotoLibraryService.self) private var photoService
-    @State private var viewModel = LibraryViewModel()
 
     private var isScanning: Bool {
         mediaType == .image
@@ -349,18 +348,7 @@ struct DuplicatesView: View {
     }
 
     private var resultsView: some View {
-        ScrollView {
-            LazyVStack(spacing: 24) {
-                ForEach(groups) { group in
-                    AssetGroupSection(
-                        group: group,
-                        viewModel: viewModel,
-                        namespace: namespace
-                    )
-                }
-            }
-            .padding(.vertical, 16)
-        }
+        DuplicateReviewView(groups: groups, kind: .duplicates, namespace: namespace)
     }
 }
 
@@ -370,7 +358,6 @@ struct SimilarPhotosView: View {
     let namespace: Namespace.ID
 
     @Environment(PhotoLibraryService.self) private var photoService
-    @State private var viewModel = LibraryViewModel()
 
     var body: some View {
         Group {
@@ -405,18 +392,11 @@ struct SimilarPhotosView: View {
     }
 
     private var resultsView: some View {
-        ScrollView {
-            LazyVStack(spacing: 24) {
-                ForEach(photoService.similarPhotoGroups) { group in
-                    AssetGroupSection(
-                        group: group,
-                        viewModel: viewModel,
-                        namespace: namespace
-                    )
-                }
-            }
-            .padding(.vertical, 16)
-        }
+        DuplicateReviewView(
+            groups: photoService.similarPhotoGroups,
+            kind: .similar,
+            namespace: namespace
+        )
     }
 }
 
@@ -440,48 +420,6 @@ private struct ScanningLoadingView: View {
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-}
-
-// MARK: - Shared: Asset Group Section
-
-private struct AssetGroupSection: View {
-    let group: DuplicateGroup
-    let viewModel: LibraryViewModel
-    let namespace: Namespace.ID
-
-    @Environment(PhotoLibraryService.self) private var photoService
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text("^[\(group.count) item](inflect: true)")
-                    .font(.headline)
-                    .foregroundStyle(.primary)
-                Spacer()
-            }
-            .padding(.horizontal, 16)
-
-            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 2), count: 3), spacing: 2) {
-                ForEach(group.assets) { asset in
-                    ThumbnailView(
-                        asset: asset,
-                        size: (UIScreen.main.bounds.width - 36) / 3,
-                        isSelected: viewModel.isSelected(asset.localIdentifier),
-                        isSelecting: viewModel.isSelecting
-                    )
-                    .clipShape(.rect(cornerRadius: 8))
-                    .onTapGesture {
-                        if viewModel.isSelecting {
-                            viewModel.toggleSelection(asset.localIdentifier)
-                        } else {
-                            viewModel.navigationPath.append(asset.localIdentifier)
-                        }
-                    }
-                }
-            }
-            .padding(.horizontal, 16)
-        }
     }
 }
 
