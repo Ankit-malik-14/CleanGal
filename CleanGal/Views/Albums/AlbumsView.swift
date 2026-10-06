@@ -63,6 +63,35 @@ struct AlbumsView: View {
                     }
                 }
 
+                if !photoService.systemAlbums.isEmpty {
+                    Section("Media Types") {
+                        ForEach(photoService.systemAlbums) { album in
+                            NavigationLink {
+                                AlbumDetailView(album: album, namespace: transitionNamespace)
+                            } label: {
+                                AlbumRow(
+                                    title: album.title,
+                                    iconName: album.kind.symbolName,
+                                    iconColor: album.kind.tint,
+                                    count: album.count
+                                )
+                            }
+                        }
+                    }
+                }
+
+                if !photoService.userAlbums.isEmpty {
+                    Section("My Albums") {
+                        ForEach(photoService.userAlbums) { album in
+                            NavigationLink {
+                                AlbumDetailView(album: album, namespace: transitionNamespace)
+                            } label: {
+                                AlbumCoverRow(album: album)
+                            }
+                        }
+                    }
+                }
+
                 // Section("Utilities") {
                 //     NavigationLink {
                 //         RecentlyDeletedView(namespace: transitionNamespace)
@@ -77,6 +106,9 @@ struct AlbumsView: View {
                 // }
             }
             .navigationTitle("Albums")
+            .task {
+                await photoService.loadAlbums()
+            }
         }
     }
 
@@ -86,6 +118,38 @@ struct AlbumsView: View {
         let total = photoService.largeVideos.reduce(Int64(0)) { $0 + $1.fileSize }
         let size = ByteCountFormatter.string(fromByteCount: total, countStyle: .file)
         return "\(photoService.largeVideos.count) videos · \(size)"
+    }
+}
+
+/// Row for the user's own albums: shows the newest photo as the cover.
+private struct AlbumCoverRow: View {
+    let album: LibraryAlbum
+
+    var body: some View {
+        HStack(spacing: 12) {
+            if let cover = album.coverAsset {
+                ThumbnailView(asset: cover, size: 44)
+                    .clipShape(.rect(cornerRadius: 8))
+            } else {
+                Image(systemName: album.kind.symbolName)
+                    .font(.title3)
+                    .foregroundStyle(album.kind.tint)
+                    .frame(width: 44, height: 44)
+                    .background(album.kind.tint.opacity(0.12))
+                    .clipShape(.rect(cornerRadius: 8))
+            }
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(album.title)
+                    .font(.body)
+                    .fontWeight(.medium)
+                Text("^[\(album.count) item](inflect: true)")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+        }
     }
 }
 

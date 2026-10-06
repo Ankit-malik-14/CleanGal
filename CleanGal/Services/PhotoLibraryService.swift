@@ -25,6 +25,10 @@ final class PhotoLibraryService {
     var largeVideos: [LargeVideo] = []
     var isLoadingLargeVideos = false
     var hasLoadedLargeVideos = false
+    var systemAlbums: [LibraryAlbum] = []
+    var userAlbums: [LibraryAlbum] = []
+    var isLoadingAlbums = false
+    var hasLoadedAlbums = false
 
     // MARK: - Private
 
@@ -97,6 +101,10 @@ final class PhotoLibraryService {
 
         dateSections = sections
         pruneScanResults()
+
+        if hasLoadedAlbums {
+            await loadAlbums()
+        }
 
         // TODO: Re-enable once stable
         // // Fetch Recently Deleted album
@@ -286,12 +294,16 @@ final class PhotoLibraryService {
     // MARK: - Image Loading
 
     func loadThumbnail(for asset: PHAsset, size: CGSize) async -> UIImage? {
-        if let cached = thumbnailCache[asset.localIdentifier] {
-            return cached
-        }
-
         let scale = UIScreen.main.scale
         let scaledSize = CGSize(width: size.width * scale, height: size.height * scale)
+        let requestedSide = max(scaledSize.width, scaledSize.height)
+
+        // Only reuse a cached image if it is big enough for this request. Otherwise a small
+        // thumbnail loaded first (e.g. in a list row) would be reused blurry in a larger grid.
+        if let cached = thumbnailCache[asset.localIdentifier],
+           Self.longestSide(of: cached) >= requestedSide * 0.9 {
+            return cached
+        }
 
         let image = await withCheckedContinuation { continuation in
             let options = PHImageRequestOptions()
@@ -310,9 +322,17 @@ final class PhotoLibraryService {
         }
 
         if let image {
-            thumbnailCache[asset.localIdentifier] = image
+            // Keep the largest version we have seen for this asset.
+            let existingSide = thumbnailCache[asset.localIdentifier].map(Self.longestSide(of:)) ?? 0
+            if Self.longestSide(of: image) > existingSide {
+                thumbnailCache[asset.localIdentifier] = image
+            }
         }
         return image
+    }
+
+    private static func longestSide(of image: UIImage) -> CGFloat {
+        max(image.size.width, image.size.height) * image.scale
     }
 
     func loadFullImage(for asset: PHAsset) async -> UIImage? {
@@ -394,6 +414,106 @@ final class PhotoLibraryService {
                 continuation.resume(returning: playerItem)
             }
         }
+    }
+
+    // MARK: - Albums
+
+    /// Loads the system smart albums (Screenshots, Videos, Selfies, ...) and the user's own
+    /// Photos albums. These are plain system fetches, so this is fast and needs no scan.
+    func loadAlbums() async {
+        guard !isLoadingAlbums else { return }
+        isLoadingAlbums = true
+        defer { isLoadingAlbums = false }
+
+        let loaded = await Task.detached(priority: .userInitiated) {
+            Self.fetchAlbums()
+        }.value
+
+        systemAlbums = loaded.system
+        userAlbums = loaded.user
+        hasLoadedAlbums = true
+    }
+
+    /// All assets in an album, newest first. Enumerated off the main thread.
+    func assets(in album: LibraryAlbum) async -> [PHAsset] {
+        let collection = album.collection
+        return await Task.detached(priority: .userInitiated) {
+            Self.enumerateAssets(in: collection)
+        }.value
+    }
+
+    private nonisolated static func fetchAlbums() -> (system: [LibraryAlbum], user: [LibraryAlbum]) {
+        let specs: [(PHAssetCollectionSubtype, LibraryAlbum.Kind)] = [
+            (.smartAlbumScreenshots, .screenshots),
+            (.smartAlbumVideos, .videos),
+            (.smartAlbumSelfPortraits, .selfies),
+            (.smartAlbumLivePhotos, .livePhotos),
+            (.smartAlbumDepthEffect, .portraits),
+            (.smartAlbumPanoramas, .panoramas),
+            (.smartAlbumSlomoVideos, .slowMotion),
+            (.smartAlbumTimelapses, .timeLapse),
+            (.smartAlbumFavorites, .favorites)
+        ]
+
+        var system: [LibraryAlbum] = []
+        for (subtype, kind) in specs {
+            let collections = PHAssetCollection.fetchAssetCollections(
+                with: .smartAlbum,
+                subtype: subtype,
+                options: nil
+            )
+            if let collection = collections.firstObject,
+               let album = Self.makeAlbum(collection, kind: kind) {
+                system.append(album)
+            }
+        }
+
+        var user: [LibraryAlbum] = []
+        let userCollections = PHAssetCollection.fetchAssetCollections(
+            with: .album,
+            subtype: .albumRegular,
+            options: nil
+        )
+        userCollections.enumerateObjects { collection, _, _ in
+            if let album = Self.makeAlbum(collection, kind: .userAlbum) {
+                user.append(album)
+            }
+        }
+        user.sort { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+
+        return (system, user)
+    }
+
+    /// Returns nil for empty albums so they don't clutter the list.
+    private nonisolated static func makeAlbum(_ collection: PHAssetCollection, kind: LibraryAlbum.Kind) -> LibraryAlbum? {
+        let options = PHFetchOptions()
+        options.includeHiddenAssets = false
+        options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: true)]
+
+        let result = PHAsset.fetchAssets(in: collection, options: options)
+        guard result.count > 0 else { return nil }
+
+        return LibraryAlbum(
+            collection: collection,
+            kind: kind,
+            title: collection.localizedTitle ?? "Untitled",
+            count: result.count,
+            coverAsset: result.lastObject // newest item
+        )
+    }
+
+    private nonisolated static func enumerateAssets(in collection: PHAssetCollection) -> [PHAsset] {
+        let options = PHFetchOptions()
+        options.includeHiddenAssets = false
+        options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+
+        let result = PHAsset.fetchAssets(in: collection, options: options)
+        var assets: [PHAsset] = []
+        assets.reserveCapacity(result.count)
+        result.enumerateObjects { asset, _, _ in
+            assets.append(asset)
+        }
+        return assets
     }
 
     // MARK: - Large Videos
@@ -699,6 +819,24 @@ final class PhotoLibraryService {
         similarPhotoGroups = prune(similarPhotoGroups)
         largeVideos.removeAll { !live.contains($0.id) }
     }
+}
+
+// MARK: - Library Album Model
+
+nonisolated struct LibraryAlbum: Identifiable, Sendable {
+    nonisolated enum Kind: Sendable {
+        case screenshots, videos, selfies, livePhotos, portraits
+        case panoramas, slowMotion, timeLapse, favorites
+        case userAlbum
+    }
+
+    let collection: PHAssetCollection
+    let kind: Kind
+    let title: String
+    let count: Int
+    let coverAsset: PHAsset?
+
+    var id: String { collection.localIdentifier }
 }
 
 // MARK: - Large Video Model
