@@ -22,6 +22,9 @@ final class PhotoLibraryService {
     var similarPhotoGroups: [DuplicateGroup] = []
     var isScanningSimilarPhotos = false
     var hasScannedSimilarPhotos = false
+    var largeVideos: [LargeVideo] = []
+    var isLoadingLargeVideos = false
+    var hasLoadedLargeVideos = false
 
     // MARK: - Private
 
@@ -32,6 +35,7 @@ final class PhotoLibraryService {
     private let similarPhotoDetector = SimilarPhotoDetector()
     private var changeObserver: LibraryChangeObserver?
     @ObservationIgnored private var reloadTask: Task<Void, Never>?
+    @ObservationIgnored private var videoSizeCache: [String: Int64] = [:]
     private(set) var thumbnailCache: [String: UIImage] = [:]
 
     // MARK: - Types
@@ -392,6 +396,74 @@ final class PhotoLibraryService {
         }
     }
 
+    // MARK: - Large Videos
+
+    /// Fetches all videos, measures their storage size, and publishes them biggest-first.
+    /// Sizes are cached per asset, so re-entering the screen (or reloading after a library
+    /// change) only measures videos it hasn't seen before. All measuring happens off the main thread.
+    func loadLargeVideos() async {
+        guard !isLoadingLargeVideos else { return }
+        isLoadingLargeVideos = true
+        defer { isLoadingLargeVideos = false }
+
+        let options = PHFetchOptions()
+        options.predicate = NSPredicate(format: "mediaType == %d", PHAssetMediaType.video.rawValue)
+        options.includeHiddenAssets = false
+        let result = PHAsset.fetchAssets(with: options)
+
+        let knownSizes = videoSizeCache
+        let measured = await Task.detached(priority: .userInitiated) {
+            Self.measureVideos(result, knownSizes: knownSizes)
+        }.value
+
+        videoSizeCache.merge(measured.sizes) { _, new in new }
+
+        // The user left the screen mid-load: keep the cache, skip publishing.
+        guard !Task.isCancelled else { return }
+
+        largeVideos = measured.videos.sorted { $0.fileSize > $1.fileSize }
+        hasLoadedLargeVideos = true
+    }
+
+    /// Removes videos from the list immediately after a successful delete,
+    /// without waiting for the library change notification.
+    func removeLargeVideos(withIdentifiers identifiers: Set<String>) {
+        largeVideos.removeAll { identifiers.contains($0.id) }
+    }
+
+    private nonisolated static func measureVideos(
+        _ result: PHFetchResult<PHAsset>,
+        knownSizes: [String: Int64]
+    ) -> (videos: [LargeVideo], sizes: [String: Int64]) {
+        var videos: [LargeVideo] = []
+        var newSizes: [String: Int64] = [:]
+        videos.reserveCapacity(result.count)
+
+        result.enumerateObjects { asset, _, _ in
+            let id = asset.localIdentifier
+            let size: Int64
+            if let known = knownSizes[id] {
+                size = known
+            } else {
+                size = Self.storageBytes(for: asset)
+                if size > 0 { newSizes[id] = size } // never cache a failed (zero) lookup
+            }
+            videos.append(LargeVideo(asset: asset, fileSize: size))
+        }
+
+        return (videos, newSizes)
+    }
+
+    /// Total bytes of the video's resources. An edited video has both the original and the
+    /// rendered edit on disk, so both count toward the space it takes up.
+    private nonisolated static func storageBytes(for asset: PHAsset) -> Int64 {
+        PHAssetResource.assetResources(for: asset)
+            .filter { $0.type == .video || $0.type == .fullSizeVideo }
+            .reduce(Int64(0)) { total, resource in
+                total + ((resource.value(forKey: "fileSize") as? Int64) ?? 0)
+            }
+    }
+
     // MARK: - EXIF / Media Info
 
     func loadMediaInfo(for asset: PHAsset) async -> MediaInfo {
@@ -625,7 +697,17 @@ final class PhotoLibraryService {
         duplicatePhotoGroups = prune(duplicatePhotoGroups)
         duplicateVideoGroups = prune(duplicateVideoGroups)
         similarPhotoGroups = prune(similarPhotoGroups)
+        largeVideos.removeAll { !live.contains($0.id) }
     }
+}
+
+// MARK: - Large Video Model
+
+nonisolated struct LargeVideo: Identifiable, Sendable {
+    let asset: PHAsset
+    let fileSize: Int64
+
+    var id: String { asset.localIdentifier }
 }
 
 // MARK: - Library Change Observer

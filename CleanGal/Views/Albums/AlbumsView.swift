@@ -49,6 +49,18 @@ struct AlbumsView: View {
                             count: photoService.similarPhotoGroups.reduce(0) { $0 + $1.count }
                         )
                     }
+
+                    NavigationLink {
+                        LargeVideosView(namespace: transitionNamespace)
+                    } label: {
+                        AlbumRow(
+                            title: "Large Videos",
+                            iconName: "film.stack",
+                            iconColor: .red,
+                            count: photoService.largeVideos.count,
+                            subtitle: largeVideosSubtitle
+                        )
+                    }
                 }
 
                 // Section("Utilities") {
@@ -67,6 +79,14 @@ struct AlbumsView: View {
             .navigationTitle("Albums")
         }
     }
+
+    /// Describes the row before it has loaded, then shows count and total size.
+    private var largeVideosSubtitle: String {
+        guard photoService.hasLoadedLargeVideos else { return "Biggest videos first" }
+        let total = photoService.largeVideos.reduce(Int64(0)) { $0 + $1.fileSize }
+        let size = ByteCountFormatter.string(fromByteCount: total, countStyle: .file)
+        return "\(photoService.largeVideos.count) videos · \(size)"
+    }
 }
 
 // MARK: - Reusable Album Row
@@ -76,6 +96,7 @@ private struct AlbumRow: View {
     let iconName: String
     let iconColor: Color
     let count: Int
+    var subtitle: String? = nil
 
     var body: some View {
         HStack(spacing: 12) {
@@ -90,9 +111,15 @@ private struct AlbumRow: View {
                 Text(title)
                     .font(.body)
                     .fontWeight(.medium)
-                Text("^[\(count) item](inflect: true)")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
+                Group {
+                    if let subtitle {
+                        Text(subtitle)
+                    } else {
+                        Text("^[\(count) item](inflect: true)")
+                    }
+                }
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
             }
 
             Spacer()
