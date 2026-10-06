@@ -1,4 +1,4 @@
-[README.md](https://github.com/user-attachments/files/33103293/README.md)
+
 # CleanGal
 
 A native iOS app that helps you reclaim space in your photo library. It browses your photos and videos, and finds **exact duplicates**, **visually similar photos** and **the largest videos**, so you can review them and delete what you don't need.
