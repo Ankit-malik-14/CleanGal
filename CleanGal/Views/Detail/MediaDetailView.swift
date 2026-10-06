@@ -59,11 +59,10 @@ struct MediaDetailView: View {
                         showInfo = true
                     }
                     Spacer()
-                    // TODO: Re-enable once deletion is stable
-                    // Button("Delete", systemImage: "trash", role: .destructive) {
-                    //     showDeleteConfirmation = true
-                    // }
-                    // .tint(.red)
+                    Button("Delete", systemImage: "trash", role: .destructive) {
+                        showDeleteConfirmation = true
+                    }
+                    .tint(.red)
                 }
             }
         }
@@ -76,18 +75,17 @@ struct MediaDetailView: View {
         .sheet(isPresented: $showShareSheet) {
             ShareSheet(items: shareItems)
         }
-        // TODO: Re-enable once deletion is stable
-        // .confirmationDialog(
-        //     "Delete Photo",
-        //     isPresented: $showDeleteConfirmation,
-        //     titleVisibility: .visible
-        // ) {
-        //     Button("Delete", role: .destructive) {
-        //         deleteCurrentAsset()
-        //     }
-        // } message: {
-        //     Text("This item will be moved to Recently Deleted.")
-        // }
+        .confirmationDialog(
+            "Delete Item",
+            isPresented: $showDeleteConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Delete", role: .destructive) {
+                deleteCurrentAsset()
+            }
+        } message: {
+            Text("This item will be moved to Recently Deleted.")
+        }
         .navigationTransition(.zoom(sourceID: currentAssetID ?? initialAssetID, in: namespace))
         .statusBarHidden(!showControls)
     }
@@ -108,11 +106,13 @@ struct MediaDetailView: View {
     }
 
     private func deleteCurrentAsset() {
-        guard let asset = currentAsset else { return }
-        let targetID = asset.localIdentifier
-        dismiss()
+        guard let targetID = currentAssetID else { return }
+        let service = photoService // capture before the view can be dismissed
+        let dismissAction = dismiss
         Task {
-            try? await photoService.deleteAssets([targetID])
+            if (try? await service.deleteAssets([targetID])) == true {
+                dismissAction()
+            }
         }
     }
 }

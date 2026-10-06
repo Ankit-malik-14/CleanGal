@@ -31,6 +31,7 @@ final class PhotoLibraryService {
     private let duplicateDetector = DuplicateDetector()
     private let similarPhotoDetector = SimilarPhotoDetector()
     private var changeObserver: LibraryChangeObserver?
+    @ObservationIgnored private var reloadTask: Task<Void, Never>?
     private(set) var thumbnailCache: [String: UIImage] = [:]
 
     // MARK: - Types
@@ -91,6 +92,7 @@ final class PhotoLibraryService {
         }.value
 
         dateSections = sections
+        pruneScanResults()
 
         // TODO: Re-enable once stable
         // // Fetch Recently Deleted album
@@ -152,12 +154,121 @@ final class PhotoLibraryService {
     func scanForSimilarPhotos() async {
         guard !isScanningSimilarPhotos else { return }
         isScanningSimilarPhotos = true
+        defer { isScanningSimilarPhotos = false }
 
         let photos = allAssetsFlat.filter { $0.mediaType == .image }
-        similarPhotoGroups = await similarPhotoDetector.findSimilarPhotos(in: photos)
+        let groups = await findSimilarPhotos(in: photos)
 
-        isScanningSimilarPhotos = false
+        // If the user left the screen mid-scan, don't publish partial results
+        // or mark the scan as done, so it runs again next time.
+        guard !Task.isCancelled else { return }
+
+        similarPhotoGroups = groups
         hasScannedSimilarPhotos = true
+    }
+
+    // MARK: - Similar Photos Pipeline
+
+    /// Shared with the detector. Photos with no neighbour inside this window
+    /// can never be grouped, so we skip them entirely.
+    private static let similarTimeWindow: TimeInterval = SimilarPhotoDetector.timeWindow
+    private static let similarThumbnailSide: CGFloat = 360
+    private static let maxConcurrentThumbnailLoads = 4
+
+    /// Loads a small thumbnail per candidate, feeds it to the detector, clusters,
+    /// then maps the resulting identifiers back to PHAssets.
+    private func findSimilarPhotos(in photos: [PHAsset]) async -> [DuplicateGroup] {
+        let candidates = Self.filterByTimeNeighbors(photos, window: Self.similarTimeWindow)
+        guard candidates.count > 1 else { return [] }
+
+        await similarPhotoDetector.reset()
+
+        // Bounded concurrency: a few thumbnails load while the detector
+        // (a separate actor, off the main thread) runs Vision on earlier ones.
+        await withTaskGroup(of: Void.self) { group in
+            var inFlight = 0
+            for asset in candidates {
+                if Task.isCancelled { break }
+
+                if inFlight >= Self.maxConcurrentThumbnailLoads {
+                    await group.next()
+                    inFlight -= 1
+                }
+
+                group.addTask { [self] in
+                    await self.addFeaturePrint(for: asset)
+                }
+                inFlight += 1
+            }
+            await group.waitForAll()
+        }
+
+        guard !Task.isCancelled else {
+            await similarPhotoDetector.reset()
+            return []
+        }
+
+        let identifierGroups = await similarPhotoDetector.cluster()
+        await similarPhotoDetector.reset() // free feature prints
+
+        let lookup = Dictionary(
+            candidates.map { ($0.localIdentifier, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+
+        return identifierGroups.compactMap { identifiers in
+            let assets = identifiers.compactMap { lookup[$0] }
+            guard assets.count > 1, let groupID = identifiers.min() else { return nil }
+            return DuplicateGroup(id: groupID, assets: assets)
+        }
+    }
+
+    private func addFeaturePrint(for asset: PHAsset) async {
+        guard let cgImage = await loadCGImage(for: asset, side: Self.similarThumbnailSide) else { return }
+        await similarPhotoDetector.addPhoto(
+            identifier: asset.localIdentifier,
+            date: asset.creationDate ?? .distantPast,
+            cgImage: cgImage
+        )
+    }
+
+    /// Small local-only thumbnail. iCloud-only photos are skipped rather than downloaded.
+    private func loadCGImage(for asset: PHAsset, side: CGFloat) async -> CGImage? {
+        await withCheckedContinuation { continuation in
+            let options = PHImageRequestOptions()
+            options.deliveryMode = .highQualityFormat // single callback, never degraded
+            options.resizeMode = .fast
+            options.isNetworkAccessAllowed = false
+
+            imageManager.requestImage(
+                for: asset,
+                targetSize: CGSize(width: side, height: side),
+                contentMode: .aspectFill,
+                options: options
+            ) { image, _ in
+                continuation.resume(returning: image?.cgImage)
+            }
+        }
+    }
+
+    /// Keeps only photos that have at least one other photo within `window` of them.
+    private nonisolated static func filterByTimeNeighbors(_ photos: [PHAsset], window: TimeInterval) -> [PHAsset] {
+        let sorted = photos.sorted {
+            ($0.creationDate ?? .distantPast) < ($1.creationDate ?? .distantPast)
+        }
+        guard sorted.count > 1 else { return [] }
+
+        var keep = Array(repeating: false, count: sorted.count)
+        for i in 1..<sorted.count {
+            let previous = sorted[i - 1].creationDate ?? .distantPast
+            let current = sorted[i].creationDate ?? .distantPast
+            if current.timeIntervalSince(previous) <= window {
+                keep[i - 1] = true
+                keep[i] = true
+            }
+        }
+
+        return zip(sorted, keep).filter(\.1).map(\.0)
     }
 
     var allAssetsFlat: [PHAsset] {
@@ -311,21 +422,26 @@ final class PhotoLibraryService {
 
     // MARK: - Operations
 
-    func deleteAssets(_ identifiers: Set<String>) async throws {
-        guard !identifiers.isEmpty else { return }
-        let idArray = Array(identifiers)
+    /// Deletes the given assets.
+    /// - Returns: `true` if the assets were deleted, `false` if the user cancelled the system prompt.
+    @discardableResult
+    func deleteAssets(_ identifiers: Set<String>) async throws -> Bool {
+        guard !identifiers.isEmpty else { return false }
 
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            PHPhotoLibrary.shared().performChanges({
-                let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: idArray, options: nil)
-                PHAssetChangeRequest.deleteAssets(fetchResult)
-            }) { success, error in
-                if let error {
-                    continuation.resume(throwing: error)
-                } else {
-                    continuation.resume(returning: ())
-                }
-            }
+        do {
+            try await Self.performDelete(Array(identifiers))
+            return true
+        } catch let error as PHPhotosError where error.code == .userCancelled {
+            return false
+        }
+    }
+
+    /// Runs the Photos change off the main actor. Photos invokes the change block on a
+    /// background queue, so it must not inherit the class's @MainActor isolation.
+    private nonisolated static func performDelete(_ identifiers: [String]) async throws {
+        try await PHPhotoLibrary.shared().performChanges {
+            let assets = PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: nil)
+            PHAssetChangeRequest.deleteAssets(assets)
         }
     }
 
@@ -473,24 +589,57 @@ final class PhotoLibraryService {
         }
     }
 
+    /// Called by Photos on a background queue.
     private nonisolated func handleLibraryChangeSynchronously(_ change: PHChange) {
-        // Re-fetch all assets safely without querying change details asynchronously
-        Task { @MainActor in
+        Task { @MainActor [weak self] in
+            self?.scheduleReload()
+        }
+    }
+
+    /// Photos often fires several change notifications for one action (e.g. a delete).
+    /// Coalesce them into a single reload instead of racing several full re-fetches.
+    private func scheduleReload() {
+        reloadTask?.cancel()
+        reloadTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(300))
+            guard !Task.isCancelled, let self else { return }
             await self.loadAssets()
         }
+    }
+
+    /// Drops deleted assets from cached scan results so the album screens
+    /// never show (or try to load) assets that no longer exist.
+    private func pruneScanResults() {
+        let live = Set(allAssetsFlat.map(\.localIdentifier))
+
+        func prune(_ groups: [DuplicateGroup]) -> [DuplicateGroup] {
+            groups.compactMap { group in
+                let remaining = group.assets.filter { live.contains($0.localIdentifier) }
+                guard remaining.count > 1 else { return nil }
+                return remaining.count == group.assets.count
+                    ? group
+                    : DuplicateGroup(id: group.id, assets: remaining)
+            }
+        }
+
+        duplicatePhotoGroups = prune(duplicatePhotoGroups)
+        duplicateVideoGroups = prune(duplicateVideoGroups)
+        similarPhotoGroups = prune(similarPhotoGroups)
     }
 }
 
 // MARK: - Library Change Observer
 
-private final class LibraryChangeObserver: NSObject, PHPhotoLibraryChangeObserver, @unchecked Sendable {
+/// Photos calls `photoLibraryDidChange` on an arbitrary background queue, so this class
+/// must NOT be main-actor isolated (the project may default unannotated types to @MainActor).
+nonisolated private final class LibraryChangeObserver: NSObject, PHPhotoLibraryChangeObserver, @unchecked Sendable {
     let handler: @Sendable (PHChange) -> Void
 
     init(handler: @escaping @Sendable (PHChange) -> Void) {
         self.handler = handler
     }
 
-    func photoLibraryDidChange(_ changeInstance: PHChange) {
+    nonisolated func photoLibraryDidChange(_ changeInstance: PHChange) {
         handler(changeInstance)
     }
 }

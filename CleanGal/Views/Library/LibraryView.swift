@@ -207,9 +207,12 @@ private struct SelectionToolbarContent: View {
         ) {
             Button("Delete", role: .destructive) {
                 let targets = viewModel.selectedIdentifiers
-                viewModel.clearSelection()
+                let service = photoService // capture before anything can tear this view down
+                let selection = viewModel
                 Task {
-                    try? await photoService.deleteAssets(targets)
+                    if (try? await service.deleteAssets(targets)) == true {
+                        selection.clearSelection()
+                    }
                 }
             }
         } message: {

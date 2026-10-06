@@ -1,27 +1,39 @@
 import Foundation
 import Vision
+import CoreGraphics
 
-/// Detects visually similar photos using Apple Vision's VNFeaturePrintObservation.
+/// Detects visually similar photos by combining two signals:
 ///
-/// Architecture: This actor receives pre-loaded CGImages (no PhotoKit dependency),
-/// generates feature prints via Vision, and clusters them by visual similarity.
-/// All PHAsset / PHImageManager work stays in PhotoLibraryService (@MainActor).
+/// 1. **Color histogram** (cheap): a 2x2 grid of 64-bin RGB histograms per photo.
+///    Photos whose color distribution differs are rejected immediately.
+/// 2. **Vision feature print** (semantic): `VNFeaturePrintObservation` distance.
+///    Only photos that pass the color check are compared this way.
 ///
-/// Strategy:
-/// 1. Generate a VNFeaturePrint (ML feature vector) per image from a 360px thumbnail.
-/// 2. Compare feature prints within a 24-hour time window (O(N×W) not O(N²)).
-/// 3. Cluster similar images using Union-Find (disjoint set).
+/// A pair must pass BOTH checks. Feature prints on their own describe *what is in*
+/// a photo (food, a face, a street), so unrelated photos of the same kind of subject
+/// can score as close. Requiring matching colors and layout removes most of those.
+///
+/// Grouping is anchor-based (no chaining): each group is built around its first photo,
+/// and a candidate must match that anchor directly. The old union-find approach linked
+/// A~B and B~C into one group even when A and C looked nothing alike.
+///
+/// Architecture: receives pre-loaded CGImages (no PhotoKit dependency). All
+/// PHAsset / PHImageManager work stays in PhotoLibraryService (@MainActor).
 actor SimilarPhotoDetector {
 
-    // Apple Vision feature print distance reference:
-    //   0    = identical
-    //   < 5  = near-identical (bursts, minor edits)
-    //   < 12 = visually similar (same scene, different angle)
-    //   > 15 = different images
-    private let distanceThreshold: Float = 10.0
+    // MARK: - Tunable thresholds
 
-    // Only compare images whose creation dates are within this window.
-    private let timeWindow: TimeInterval = 24 * 3600
+    /// Only photos taken within this window of a group's anchor can join it.
+    /// PhotoLibraryService uses the same value to skip photos with no neighbours.
+    nonisolated static let timeWindow: TimeInterval = 3600
+
+    /// Vision feature print distance: smaller = more similar. Apple does not document the
+    /// scale, so tune this on real data (lower = stricter, fewer and tighter groups).
+    private let featurePrintThreshold: Float = 6.0
+
+    /// Color histogram intersection, 0...1 (1 = identical color distribution and layout).
+    /// Higher = stricter.
+    private let minColorSimilarity: Float = 0.70
 
     // MARK: - Internal Storage
 
@@ -29,15 +41,18 @@ actor SimilarPhotoDetector {
         let identifier: String
         let date: Date
         let featurePrint: VNFeaturePrintObservation
+        let color: [Float]
     }
 
     private var prints: [IndexedPrint] = []
 
     // MARK: - Public API
 
-    /// Generates and stores a Vision feature print for one photo.
+    /// Computes the color signature and Vision feature print for one photo and stores them.
     /// Call this once per image, then call `cluster()`.
     func addPhoto(identifier: String, date: Date, cgImage: CGImage) {
+        guard let color = Self.makeColorSignature(from: cgImage) else { return }
+
         let request = VNGenerateImageFeaturePrintRequest()
         let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
 
@@ -47,7 +62,8 @@ actor SimilarPhotoDetector {
                 prints.append(IndexedPrint(
                     identifier: identifier,
                     date: date,
-                    featurePrint: fp
+                    featurePrint: fp,
+                    color: color
                 ))
             }
         } catch {
@@ -55,7 +71,7 @@ actor SimilarPhotoDetector {
         }
     }
 
-    /// Clusters all stored feature prints into groups of similar photos.
+    /// Groups stored photos by similarity.
     /// Returns arrays of asset identifiers, largest groups first.
     func cluster() -> [[String]] {
         guard prints.count > 1 else { return [] }
@@ -63,81 +79,117 @@ actor SimilarPhotoDetector {
         // Sort by creation date for time-window optimization
         let sorted = prints.sorted { $0.date < $1.date }
         let n = sorted.count
-        let uf = UnionFind(count: n)
 
-        for i in 0..<n {
+        var assigned = Array(repeating: false, count: n)
+        var groups: [[String]] = []
+
+        for i in 0..<n where !assigned[i] {
+            let anchor = sorted[i]
+            var members = [anchor.identifier]
+
             for j in (i + 1)..<n {
-                let gap = sorted[j].date.timeIntervalSince(sorted[i].date)
-                if gap > timeWindow { break } // Sorted — no point checking further
+                if sorted[j].date.timeIntervalSince(anchor.date) > Self.timeWindow { break }
+                if assigned[j] { continue }
 
-                var distance: Float = 0
-                do {
-                    try sorted[i].featurePrint.computeDistance(&distance, to: sorted[j].featurePrint)
-                    if distance < distanceThreshold {
-                        uf.union(i, j)
-                    }
-                } catch {
-                    continue
+                if isSimilar(anchor, sorted[j]) {
+                    assigned[j] = true
+                    members.append(sorted[j].identifier)
                 }
+            }
+
+            if members.count > 1 {
+                assigned[i] = true
+                groups.append(members)
             }
         }
 
-        // Collect groups with >1 member
-        var groups: [Int: [String]] = [:]
-        for i in 0..<n {
-            groups[uf.find(i), default: []].append(sorted[i].identifier)
-        }
+        let result = groups.sorted { $0.count > $1.count }
 
-        return groups.values
-            .filter { $0.count > 1 }
-            .sorted { $0.count > $1.count }
+        #if DEBUG
+        print("[SimilarPhotos] photos=\(n) groups=\(result.count) largest=\(result.first?.count ?? 0)")
+        #endif
+
+        return result
     }
 
     /// Clears stored feature prints to free memory.
     func reset() {
         prints.removeAll()
     }
-}
 
-// MARK: - Union-Find (Disjoint Set)
+    // MARK: - Comparison
 
-/// Classic union-find with path compression and union by rank.
-private final class UnionFind {
-    private var parent: [Int]
-    private var rank: [Int]
+    private func isSimilar(_ a: IndexedPrint, _ b: IndexedPrint) -> Bool {
+        // Cheap check first
+        guard Self.colorSimilarity(a.color, b.color) >= minColorSimilarity else { return false }
 
-    init(count: Int) {
-        parent = Array(0..<count)
-        rank = Array(repeating: 0, count: count)
+        var distance: Float = 0
+        do {
+            try a.featurePrint.computeDistance(&distance, to: b.featurePrint)
+        } catch {
+            return false
+        }
+        return distance < featurePrintThreshold
     }
 
-    func find(_ x: Int) -> Int {
-        // Iterative path compression (safe for large sets)
-        var root = x
-        while parent[root] != root {
-            root = parent[root]
+    // MARK: - Color Histogram
+
+    private nonisolated static let histogramSide = 32          // image is downsampled to 32x32
+    private nonisolated static let binsPerQuadrant = 64        // 4 levels per RGB channel
+    private nonisolated static let quadrantCount = 4           // 2x2 spatial grid
+
+    /// Builds a 2x2 grid of 64-bin RGB histograms (256 values). Each quadrant sums to 1,
+    /// so the spatial layout of color is preserved, not just the overall palette.
+    private nonisolated static func makeColorSignature(from cgImage: CGImage) -> [Float]? {
+        let side = histogramSide
+        var pixels = [UInt8](repeating: 0, count: side * side * 4)
+
+        let drawn = pixels.withUnsafeMutableBytes { buffer -> Bool in
+            guard let context = CGContext(
+                data: buffer.baseAddress,
+                width: side,
+                height: side,
+                bitsPerComponent: 8,
+                bytesPerRow: side * 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else { return false }
+
+            context.interpolationQuality = .low
+            context.draw(cgImage, in: CGRect(x: 0, y: 0, width: side, height: side))
+            return true
         }
-        var current = x
-        while current != root {
-            let next = parent[current]
-            parent[current] = root
-            current = next
+        guard drawn else { return nil }
+
+        var histogram = [Float](repeating: 0, count: quadrantCount * binsPerQuadrant)
+        let half = side / 2
+
+        for y in 0..<side {
+            for x in 0..<side {
+                let offset = (y * side + x) * 4
+                let r = Int(pixels[offset] >> 6)
+                let g = Int(pixels[offset + 1] >> 6)
+                let b = Int(pixels[offset + 2] >> 6)
+
+                let quadrant = (y < half ? 0 : 2) + (x < half ? 0 : 1)
+                histogram[quadrant * binsPerQuadrant + ((r << 4) | (g << 2) | b)] += 1
+            }
         }
-        return root
+
+        let pixelsPerQuadrant = Float(half * half)
+        for index in histogram.indices {
+            histogram[index] /= pixelsPerQuadrant
+        }
+        return histogram
     }
 
-    func union(_ x: Int, _ y: Int) {
-        let rootX = find(x)
-        let rootY = find(y)
-        guard rootX != rootY else { return }
-
-        if rank[rootX] < rank[rootY] {
-            parent[rootX] = rootY
-        } else if rank[rootX] > rank[rootY] {
-            parent[rootY] = rootX
-        } else {
-            parent[rootY] = rootX
-            rank[rootX] += 1
+    /// Histogram intersection averaged over the four quadrants. Range 0...1.
+    private nonisolated static func colorSimilarity(_ a: [Float], _ b: [Float]) -> Float {
+        guard a.count == b.count, !a.isEmpty else { return 0 }
+        var overlap: Float = 0
+        for index in a.indices {
+            overlap += min(a[index], b[index])
         }
+        return overlap / Float(quadrantCount)
     }
 }
